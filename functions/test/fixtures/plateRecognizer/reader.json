@@ -1,0 +1,47 @@
+{
+  "processing_time": 41.2,
+  "timestamp": "2026-08-23T21:00:00.000000Z",
+  "camera_id": null,
+  "filename": "plate.jpg",
+  "results": [
+    {
+      "box": {
+        "xmin": 85,
+        "ymin": 85,
+        "ymax": 211,
+        "xmax": 331
+      },
+      "plate": "abc123",
+      "score": 0.904,
+      "dscore": 0.92,
+      "region": {
+        "code": "us-in",
+        "score": 0.88
+      },
+      "vehicle": {
+        "type": "Sedan",
+        "score": 0.71,
+        "box": {
+          "xmin": 0,
+          "ymin": 0,
+          "ymax": 400,
+          "xmax": 600
+        }
+      },
+      "candidates": [
+        {
+          "plate": "abc123",
+          "score": 0.904
+        },
+        {
+          "plate": "a8c123",
+          "score": 0.061
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "calls": 1,
+    "max_calls": 2500
+  }
+}

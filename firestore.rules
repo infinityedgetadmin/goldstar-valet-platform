@@ -1,0 +1,712 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function claims() { return request.auth.token; }
+    function roles() { return signedIn() && 'roles' in claims() ? claims().roles : []; }
+    function isPlatformAdmin() { return signedIn() && roles().hasAny(['platform_admin']); }
+    function notExpiredAssumption() { return !('assumedUntil' in claims()) || claims().assumedUntil > request.time.toMillis(); }
+    // Ruling C: a suspended operator's staff must actually lose access at the rules boundary — before
+    // this, platformSetOperatorStatus('suspended') only flipped the doc's `status` field with no
+    // enforcement anywhere (identity/claims.handler.ts's syncClaimsHandler only reads a USER's own
+    // status, never the parent operator's). Gated here, inlined into inOperator() (not a separate
+    // operatorActive()-style helper — see below for why), so every staff-side rule in this file, which
+    // already composes through inOperator()/staffOf(), picks it up at a single choke point.
+    // - .data.get('status', 'active') (the same Map.get(key, default) idiom resource.data.attendants
+    //   .get('claimedBy', '') already uses for ticket rules) makes the "missing status field never
+    //   locks everyone out" decision explicit: only an EXPLICIT 'suspended' value denies; a doc with no
+    //   status field at all (shouldn't happen in practice — operatorSchema always writes one — but this
+    //   is the safe default if it ever did) reads as 'active' and is allowed through. No exists() guard
+    //   (unlike eligible()'s idiom just below): a caller's operatorId claim only ever comes from a real
+    //   operator doc (operators/{op} is never deletable — `allow delete: if false` — and Functions only
+    //   mints an operatorId claim for a doc it just created/verified), so get().data throwing on a
+    //   nonexistent doc here just means DENY on a scenario that shouldn't occur; the extra exists() call
+    //   was tried and measured to cost real complexity budget for no correctness benefit (below).
+    // - Document-access cost: +1 distinct path (operators/{op}) per call to inOperator(), cached across
+    //   repeat calls with the same op within one evaluation — nowhere near the 10-document/single-request
+    //   limit even on the file's heaviest rule (tickets/{ticketId}'s update, which separately touches up
+    //   to 3 more paths via inVenue()'s own >=20-venueIds fallback and transitionRequirements()'s two
+    //   eligible() calls). Verified against Firebase's actual current docs (WebFetch of
+    //   firebase.google.com/docs/firestore/security/rules-conditions, not assumed): 10 for
+    //   single-document requests/queries, 20 for multi-document/transactions/batched writes.
+    // - Expression-COUNT cost (a separate, undocumented interpreter limit, NOT the document-access one
+    //   above — "Unable to evaluate the expression as the maximum of 1000 expressions to evaluate has
+    //   been reached"): this is what actually broke first. tickets/{ticketId}'s `allow update` is by far
+    //   this file's most complex single rule (5 ORed branches, several already calling
+    //   inOperator()/staffOf()/inVenue() multiple times each), and it was apparently already close to
+    //   that 1000-expression ceiling — adding get()-based logic to inOperator() (called repeatedly
+    //   through that one rule) tipped 4 of the emulator suite's existing tests over it, all in that rule
+    //   or things that write through it in a batch (ticket state-machine test, the drive_home
+    //   arrived→completed damage-report-count test, the myClaimed/myPrimaryJobs/myChaseJobs list query,
+    //   the keyTags custody-batch release test). Fixed empirically (measuring pass/fail after each
+    //   change, since this limit isn't something a rule can introspect): dropped the exists() guard
+    //   (cost with no benefit, per above) and — the fix that actually cleared the last failure —
+    //   extracted venueMatch() below so tickets/{ticketId}'s update rule stops re-verifying inOperator()
+    //   a SECOND time via inVenue() in branches that already have it as an explicit sibling conjunct.
+    function inOperator(op) {
+      return signedIn() && 'operatorId' in claims() && claims().operatorId == op && notExpiredAssumption()
+        && get(/databases/$(database)/documents/operators/$(op)).data.get('status', 'active') != 'suspended';
+    }
+    function hasRole(list) { return roles().hasAny(list); }
+    function isManager() { return hasRole(['owner', 'admin', 'lead']); }
+    function isAdmin() { return hasRole(['owner', 'admin']); }
+    function isOwner() { return hasRole(['owner']); }
+    function isGuest() { return signedIn() && roles().hasAny(['guest']); }
+    function venueIds() { return 'venueIds' in claims() ? claims().venueIds : []; }
+    // Ruling C: split out of inVenue() below (which still calls this, unchanged from the caller's
+    // perspective) so a caller that has ALREADY verified inOperator(op) explicitly — e.g.
+    // tickets/{ticketId}'s update rule's `inOperator(op) && (isManager() || inVenue(op, ...))` — can
+    // check venue membership WITHOUT inVenue() redundantly re-running inOperator()'s (now get()-backed)
+    // logic a second time. Purely a complexity-budget optimization (see inOperator()'s comment above) —
+    // behaviorally identical to inlining inVenue()'s second `&&` operand.
+    function venueMatch(op, venueId) {
+      // claims carry at most 20 venue ids; a full token falls back to the user doc
+      return isAdmin() || venueId in venueIds()
+        || (venueIds().size() >= 20 && venueId in get(/databases/$(database)/documents/operators/$(op)/users/$(request.auth.uid)).data.venueIds);
+    }
+    function inVenue(op, venueId) { return inOperator(op) && venueMatch(op, venueId); }
+    function staffOf(op) { return inOperator(op) && hasRole(['owner', 'admin', 'lead', 'attendant', 'driver']); }
+    function affected() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function onlyChanged(keys) { return affected().hasOnly(keys); }
+    function unchanged(keys) { return !affected().hasAny(keys); }
+    // affectedKeys() is TOP-LEVEL ONLY. Nested maps need their own diff:
+    function mapChanged(key) { return affected().hasAny([key]); }
+    function subKeys(key) { return (key in request.resource.data ? request.resource.data[key] : {}).diff(key in resource.data ? resource.data[key] : {}).affectedKeys(); }
+    function subOnly(key, allowed) { return !mapChanged(key) || subKeys(key).hasOnly(allowed); }
+    function subUnchanged(key, locked) { return !mapChanged(key) || !subKeys(key).hasAny(locked); }
+    function roleCeilingOk(roles) { return !roles.hasAny(['platform_admin']) && (isOwner() || isPlatformAdmin() || !roles.hasAny(['owner'])); }
+    function isUuid(s) { return s.matches('^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'); }
+    function isIso(s) { return s is string && s.matches('^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$'); }
+    function createOnly() { return resource == null; }
+
+    // ---------- platform ----------
+    match /platform/{docId} {
+      allow read: if signedIn();
+      allow write: if isPlatformAdmin();
+    }
+    match /platform/auditLog/entries/{id} { allow read: if isPlatformAdmin(); allow write: if false; }
+
+    // ---------- guests (cross-operator) ----------
+    // M1 (Plan 6 final wave): `deletedAt`/`deletedPhoneHash` are Functions-only. They were absent
+    // from BOTH guards below, so a guest could pre-set `deletedAt` on their own document and
+    // `guestDeleteAccount` would then skip anonymization entirely — the Auth user gets deleted, the
+    // PII SURVIVES, and the audit row records a completed deletion. The surviving PII is the leak;
+    // the audit entry asserting a deletion that did not happen is worse, because that row is the
+    // record we would rely on to prove the deletion for a data-subject request.
+    match /guests/{uid} {
+      allow read: if isGuest() && request.auth.uid == uid;
+      allow create: if isGuest() && request.auth.uid == uid && request.resource.data.phoneE164 == claims().phone_number
+                       && !('stripeCustomerId' in request.resource.data)
+                       && !('deletedAt' in request.resource.data) && !('deletedPhoneHash' in request.resource.data);
+      allow update: if isGuest() && request.auth.uid == uid && unchanged(['phoneE164', 'stripeCustomerId', 'lastOperatorId', 'deletedAt', 'deletedPhoneHash']);
+      allow delete: if false;
+    }
+
+    // ---------- device/app telemetry (self-reported client health, Plan 4a) ----------
+    match /telemetry/{uid} {
+      allow read: if false;
+      // Plan 8 Task 14: operatorId is pinned to the caller's claim — the analytics rollup queries
+      // this collection by operatorId, so an unpinned value would let one operator's device
+      // inject rows into another operator's sync-health figures.
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['operatorId', 'day', 'photosUploaded', 'photosNeedsAttention', 'writesPending', 'appVersion', 'platform', 'updatedAt'])
+        && 'operatorId' in claims() && request.resource.data.operatorId == claims().operatorId;
+      allow delete: if false;
+    }
+
+    // ---------- Functions-only top-level ----------
+    match /invitations/{id} { allow read, write: if false; }
+    match /outboundMessages/{id} { allow read, write: if false; }
+    match /processedEvents/{id} { allow read, write: if false; }
+    match /rateLimits/{id} { allow read, write: if false; }
+    match /pushEvents/{id} { allow read, write: if false; }
+    match /surveys/{id} { allow read: if false; allow write: if false; }   // Functions-only (guestSurvey callable, Plan 7 T1)
+
+    // ---------- guest projection (public by unguessable token) ----------
+    // Ruling T: `read` = get + list in rules v2. The document ID IS the secret token (the guest's
+    // capability to request/pay/drive-home) — an unconstrained `allow read: if true` let anyone run
+    // an unfiltered collection LIST and enumerate every token across every operator. get-only closes
+    // that: a client must already possess the exact token to read its projection; listing is denied.
+    match /guestTickets/{token} {
+      allow get: if true;
+      allow list: if false;
+      allow write: if false;
+    }
+    match /venuePublic/{venueToken} {   // Functions-written static-checkout projection (Plan 3 T5, Plan 4a T5)
+      allow get: if true;
+      allow list: if false;   // Ruling T: same token-enumeration hygiene as guestTickets, lower impact but same fix
+      allow write: if false;
+    }
+
+    // ---------- marketing site (goldstar-web) ----------
+    match /contactMessages/{id} {
+      allow create: if request.resource.data.keys().hasAll(['name', 'email', 'message']) && request.resource.data.message is string && request.resource.data.message.size() <= 4000;
+      allow read, update, delete: if false;
+    }
+    match /newsletterSubscriptions/{id} {
+      allow create: if request.resource.data.keys().hasAll(['email']) && request.resource.data.email is string && request.resource.data.email.size() <= 254;
+      allow read, update, delete: if false;
+    }
+    match /quoteRequests/{id} { allow read, write: if false; }
+    match /teamApplications/{id} { allow read, write: if false; }
+
+    // ---------- custodyEvents collection-group reads ----------
+    // Firestore only authorizes a collectionGroup() query against a match declared with the {path=**}
+    // recursive wildcard — an explicit ancestor-chain match (operators/{op}/tickets/{ticketId}/custodyEvents/{eventId})
+    // does NOT get evaluated for collection-group queries at all, regardless of its own allow rules. Since op/ticketId
+    // path wildcards aren't where()-constrainable, only the actorUid self-read (a plain resource.data/request.auth
+    // equality with no ancestor dependency) is provable for an unconstrained-by-path collection-group query; the
+    // operator/venue-scoped branches stay on the ancestor-chain match above, which still governs get/create/direct list.
+    // GUARD: the {path=**} wildcard is unscoped by ancestor — this match governs a collectionGroup('custodyEvents')
+    // query against ANY subcollection literally named `custodyEvents` anywhere in the document tree, not only
+    // operators/{op}/tickets/{ticketId}/custodyEvents. Keep this branch list-only and this narrow (actorUid ==
+    // request.auth.uid); do not widen it without re-auditing every custodyEvents-named subcollection in the schema.
+    match /{path=**}/custodyEvents/{eventId} {
+      allow list: if resource.data.actorUid == request.auth.uid;
+    }
+
+    // ---------- damageReports/photos collection-group reads (Ruling X / finding 5) ----------
+    // Same {path=**} mechanics as custodyEvents above: this governs collectionGroup('photos') queries
+    // against ANY subcollection literally named `photos` anywhere in the tree, not only
+    // damageReports/{id}/photos. List-only, self-scoped (actorUid == request.auth.uid) — the QUERIES
+    // registry's myPhotos query was indexed in Task 4 but had no matching list rule until now. Do not
+    // widen without re-auditing every photos-named subcollection in the schema.
+    match /{path=**}/photos/{photoId} {
+      allow list: if resource.data.actorUid == request.auth.uid;
+    }
+
+    // ---------- guest ticket history across operators (guest app) ----------
+    // Same {path=**} collection-group mechanics as custodyEvents above: this governs collectionGroup('tickets')
+    // queries against ANY subcollection literally named `tickets` anywhere in the tree. The query MUST filter
+    // EITHER guest.uid == uid OR guest.phoneE164 == the caller's verified phone claim (Ruling X — the
+    // guestByPhone query in QUERIES targets web-created tickets that have no guest.uid yet); an
+    // unconstrained or wrongly-filtered list is denied either way.
+    match /{path=**}/tickets/{ticketId} {
+      allow list: if isGuest() && (resource.data.guest.uid == request.auth.uid
+        || ('phone_number' in claims() && resource.data.guest.phoneE164 == claims().phone_number));
+    }
+
+    // ---------- operators ----------
+    match /operators/{op} {
+      allow get: if isPlatformAdmin() || inOperator(op);   // guests read branding from projections, never the operator doc
+      allow list: if isPlatformAdmin();
+      allow create: if isPlatformAdmin() && request.resource.data.id == op;
+      // Ruling U: platformFeeBps/provider/chargeModel are the platform's own revenue-share terms —
+      // pin them exactly like connectedAccountId so an owner can't zero their own platform fee.
+      //
+      // Ruling E-4a (final-review F4): spec §2.2's role table grants `admin` "...branding", but this
+      // rule previously admitted only platform_admin/owner — every admin who used the dashboard's
+      // Branding page got a 100%-failing save (rules denial surfaced as a generic toast). Third
+      // branch below: an admin may update ONLY branding (+ updatedAt, which every branding writer in
+      // the dashboard — branding-editor.tsx, logo-upload.tsx — sets alongside it) via onlyChanged(),
+      // the inverse idiom of the owner branch's unchanged() pin above. A lead (not in isAdmin()) still
+      // has no write path onto this doc at all; the owner branch above already subsumes an owner
+      // touching branding, so this branch only actually WIDENS what an admin (non-owner) can do.
+      allow update: if (isPlatformAdmin()) || (inOperator(op) && isOwner() && unchanged(['id', 'slug', 'status', 'plan', 'isSandbox', 'createdAt', 'createdBy'])
+                        && (!mapChanged('modules') || (
+                             request.resource.data.modules.payments.get('connectedAccountId', null) == resource.data.modules.payments.get('connectedAccountId', null)
+                             && request.resource.data.modules.payments.get('platformFeeBps', null) == resource.data.modules.payments.get('platformFeeBps', null)
+                             && request.resource.data.modules.payments.get('provider', null) == resource.data.modules.payments.get('provider', null)
+                             && request.resource.data.modules.payments.get('chargeModel', null) == resource.data.modules.payments.get('chargeModel', null))))
+                     || (inOperator(op) && isAdmin() && onlyChanged(['branding', 'updatedAt']));
+      allow delete: if false;
+
+      match /venues/{venueId} {
+        allow get: if isPlatformAdmin() || inVenue(op, venueId) || (inOperator(op) && hasRole(['venue_user']) && venueId in venueIds());
+        // Plan 8 carry #40: venue_user removed from list — a list over the whole venues collection
+        // enumerates every property the operator serves to one hotel's front desk. The portal already
+        // fetches its own venue(s) by id through the `get` rule above, which stays venue-scoped.
+        allow list: if isPlatformAdmin() || (inOperator(op) && (isAdmin() || hasRole(['lead', 'attendant', 'driver'])));
+        // Plan 8 Task 12 (#15): `pushSlug` is minted by the venue trigger and never set by a client —
+        // a client-chosen slug is a guessable slug. Same pin shape as qr.staticCheckoutToken below.
+        allow create: if isPlatformAdmin() || (inOperator(op) && isAdmin() && request.resource.data.operatorId == op && !('stripeLocationId' in request.resource.data) && !('pushSlug' in request.resource.data));
+        // Fix round 1, M2 (task-5-review.md): subUnchanged('qr', ['staticCheckoutToken']) blocks a
+        // client from ever setting/overwriting qr.staticCheckoutToken directly — nothing previously
+        // stopped an operator admin from pointing venue B's token at venue A's already-printed
+        // signage value, silently redirecting venue A's guest checkout QR to venue B's
+        // branding/rates once onVenueWritten re-projects it. The Functions trigger (Admin SDK)
+        // still mints/keeps the token exactly as before — this only pins it against CLIENT writes.
+        // qr.staticCheckoutEnabled stays freely writable (StaticQrPanel's legitimate toggle path).
+        allow update: if isPlatformAdmin() || (inOperator(op) && isAdmin() && unchanged(['operatorId', 'stripeLocationId', 'pushSlug']) && subUnchanged('qr', ['staticCheckoutToken']));
+        allow delete: if isPlatformAdmin() || (inOperator(op) && isOwner());
+      }
+
+      match /users/{uid} {
+        allow get: if isPlatformAdmin() || (inOperator(op) && (isManager() || request.auth.uid == uid));
+        allow list: if isPlatformAdmin() || (inOperator(op) && isManager());
+        allow create: if isPlatformAdmin() || (inOperator(op) && isAdmin() && request.resource.data.operatorId == op && roleCeilingOk(request.resource.data.roles)
+                         && !('eligibility' in request.resource.data) && !('stripeConnectAccountId' in request.resource.data) && !('payoutStatus' in request.resource.data));
+        allow update: if ( (isPlatformAdmin() || (inOperator(op) && isAdmin()))
+                           && unchanged(['uid', 'operatorId', 'eligibility', 'stripeConnectAccountId', 'payoutStatus'])
+                           && (!mapChanged('roles') || roleCeilingOk(request.resource.data.roles)) )
+                      || ( inOperator(op) && request.auth.uid == uid
+                           && onlyChanged(['displayName', 'phone', 'avatarPath', 'fcmTokens', 'credentials', 'lastSeenAt', 'notificationPrefs'])
+                           && subOnly('credentials', ['documents']) );   // self: upload documents only; admins adjudicate expiries/background
+        allow delete: if false;
+        match /payouts/{payoutId} { allow read: if inOperator(op) && (request.auth.uid == uid || isAdmin()); allow write: if false; }
+      }
+
+      match /fleetVehicles/{id} {
+        allow read: if isPlatformAdmin() || staffOf(op);
+        allow create: if isPlatformAdmin() || (inOperator(op) && isAdmin());
+        // currentDriverUid is Functions-only (assigned by the drive_home/passenger_ride flow, not the client).
+        allow update: if isPlatformAdmin() || (inOperator(op) && isAdmin() && unchanged(['currentDriverUid']));
+        allow delete: if isPlatformAdmin() || (inOperator(op) && isOwner());
+      }
+
+      match /shifts/{shiftId} {
+        allow get: if isPlatformAdmin() || (inOperator(op) && (isManager() || inVenue(op, resource.data.venueId)));
+        allow list: if isPlatformAdmin() || (inOperator(op) && (isManager() || resource.data.venueId in venueIds() || request.auth.uid in resource.data.assignedUids));
+        allow create: if isPlatformAdmin() || (inOperator(op) && isManager() && request.resource.data.operatorId == op && request.resource.data.source.provider == 'internal');
+        allow update: if isPlatformAdmin() || (inOperator(op) && isManager() && unchanged(['id', 'operatorId', 'venueId', 'source', 'tipPool']));
+        allow delete: if isPlatformAdmin() || (inOperator(op) && isAdmin());
+        match /clockEvents/{eventId} {
+          allow read: if isPlatformAdmin() || (inOperator(op) && (isManager() || resource.data.uid == request.auth.uid));
+          allow create: if inOperator(op) && createOnly() && isUuid(eventId) && request.resource.data.id == eventId && request.resource.data.uid == request.auth.uid
+                         && request.resource.data.type in ['in', 'out', 'break_start', 'break_end'] && isIso(request.resource.data.at) && request.resource.data.deviceId is string;
+          allow update, delete: if false;
+        }
+      }
+
+      match /keyTags/{tagId} {
+        allow get: if isPlatformAdmin() || inVenue(op, resource.data.venueId);
+        allow list: if isPlatformAdmin() || (staffOf(op) && resource.data.venueId in venueIds()) || (inOperator(op) && isAdmin());
+        allow create: if isPlatformAdmin() || (inOperator(op) && isAdmin() && request.resource.data.operatorId == op);
+        // custody coupling: a tag changes hands only together with the ticket that references it (same batch) and a custody event
+        allow update: if isPlatformAdmin() || (inOperator(op) && isAdmin() && unchanged(['operatorId', 'currentTicketId', 'lastCustodyEventId', 'id', 'createdAt']) && request.resource.data.status != 'assigned')
+          || ( staffOf(op) && inVenue(op, resource.data.venueId)
+               && ( ( onlyChanged(['status', 'currentTicketId', 'lastCustodyEventId'])
+                      && ( (request.resource.data.status == 'assigned' && resource.data.status == 'available' && request.resource.data.currentTicketId is string
+                             && getAfter(/databases/$(database)/documents/operators/$(op)/tickets/$(request.resource.data.currentTicketId)).data.keyTagId == tagId
+                             && custodyInBatch(op, request.resource.data.currentTicketId, 'keys_stored'))
+                        || (request.resource.data.status == 'available' && resource.data.status == 'assigned' && !('currentTicketId' in request.resource.data)
+                             && getAfter(/databases/$(database)/documents/operators/$(op)/tickets/$(resource.data.currentTicketId)).data.status in ['delivered', 'closed', 'cancelled']
+                             && custodyInBatch(op, resource.data.currentTicketId, 'keys_returned')) ) )
+                   // Ruling J: marking a tag lost/retired may only ever touch `status` — never currentTicketId/
+                   // lastCustodyEventId — so a manager can't rewrite custody fields outside the coupled batch path.
+                   || (onlyChanged(['status']) && request.resource.data.status in ['lost', 'retired'] && isManager()) ) );
+        allow delete: if isPlatformAdmin() || (inOperator(op) && isAdmin());
+      }
+      function custodyInBatch(op, ticketId, action) {
+        let p = /databases/$(database)/documents/operators/$(op)/tickets/$(ticketId)/custodyEvents/$(request.resource.data.lastCustodyEventId);
+        return request.resource.data.lastCustodyEventId is string && !exists(p) && existsAfter(p) && getAfter(p).data.action == action && getAfter(p).data.actorUid == request.auth.uid;
+      }
+
+      // ---------- tickets ----------
+      function ticketVenue() { return resource.data.venueId; }
+      function isGuestOf(d) { return isGuest() && (('uid' in d.guest && d.guest.uid == request.auth.uid) || ('phone_number' in claims() && 'phoneE164' in d.guest && d.guest.phoneE164 == claims().phone_number)); }
+      // On CREATE the client fully controls request.resource.data, so a self-referential guest.uid match is
+      // trivially satisfiable by any authenticated guest and proves nothing; only a verified phone match (the
+      // 'phone_number' custom claim set by phone auth) is a trustworthy identity check at create time.
+      function isGuestOfPhone(d) { return isGuest() && 'phone_number' in claims() && 'phoneE164' in d.guest && d.guest.phoneE164 == claims().phone_number; }
+      function canReadTicket(op) {
+        return isPlatformAdmin() || (inOperator(op) && (isManager() || inVenue(op, ticketVenue()) || (hasRole(['venue_user']) && ticketVenue() in venueIds()))) || isGuestOf(resource.data);
+      }
+      function validTicketShape(d, op, id) {
+        return d.id == id && isUuid(id) && d.operatorId == op && d.venueId is string && d.jobType in ['valet', 'drive_home', 'passenger_ride']
+          && d.guestToken is string && d.guestToken.matches('^[A-Za-z0-9_-]{22}$') && d.source in ['staff', 'guest_web', 'guest_app', 'host_portal', 'pms']
+          && !('payment' in d) && !('metrics' in d) && d.times.checkedInAt is string && d.guest.phoneLast4 is string && d.guest.phoneLast4.size() == 4
+          && (!('uid' in d.guest) || d.guest.uid == request.auth.uid)
+          && (!('driveHome' in d) || !('quote' in d.driveHome)) && (!('ride' in d) || !('quote' in d.ride));
+      }
+      function initialStatusOk(d) { return (d.jobType == 'valet' && d.status == 'checked_in') || (d.jobType != 'valet' && d.status == 'requested'); }
+      function isClaimant() { return resource.data.attendants.get('claimedBy', '') == request.auth.uid || resource.data.attendants.get('primaryDriverUid', '') == request.auth.uid || resource.data.attendants.get('chaseDriverUid', '') == request.auth.uid; }
+      function eligible(op, uid, field) { return uid is string && exists(/databases/$(database)/documents/operators/$(op)/users/$(uid)) && get(/databases/$(database)/documents/operators/$(op)/users/$(uid)).data.eligibility[field] == true; }
+      function transitionRequirements(op, id) {
+        let d = request.resource.data; let s = resource.data;
+        return (s.status != 'closed' && s.status != 'cancelled')
+          && (d.status != 'claimed' || (!('claimedBy' in s.attendants) && (d.attendants.claimedBy == request.auth.uid || isManager())))
+          && (d.status != 'delivered' || (d.attendants.deliveredBy == request.auth.uid && d.times.deliveredAt is string && custodyInBatch(op, id, 'keys_returned')))
+          && (d.status != 'cancelled' || (d.cancelReason is string && d.cancelReason.size() > 0))
+          && (!(d.jobType == 'drive_home' && d.status == 'assigned') || (eligible(op, d.attendants.primaryDriverUid, 'driveHome') && eligible(op, d.attendants.chaseDriverUid, 'driveHome') && d.attendants.primaryDriverUid != d.attendants.chaseDriverUid))
+          && (!(d.jobType == 'passenger_ride' && d.status == 'assigned') || (eligible(op, d.attendants.primaryDriverUid, 'passengerRide') && d.vehicle.fleetVehicleId is string))
+          && (!(d.jobType == 'drive_home' && d.status == 'in_transit') || d.damageReportIds.size() >= 1)   // phase/photo-count verified + reverted by Functions (Plan 5 T2)
+          && (!(d.jobType == 'drive_home' && d.status == 'completed') || d.damageReportIds.size() >= 2)   // Ruling Z (finding 8): post-drive report floor mirroring the pre-drive one — 'completed' triggers payment capture (§5.2), so a driver may not complete with zero post-drive evidence. Phase/photo-count verified + reverted by Functions (Plan 5 T2).
+          // Plan 8 H1(b) rules half: confirmed->assigned requires an authorized/paid payment, mirroring
+          // dispatch/assign.ts:120-122 exactly — a passenger_ride billed to the venue or a room has no
+          // guest card to authorize by design (the venue is invoiced / the folio is posted), so it must
+          // stay dispatchable. drive_home has no billTo and always needs the card. Four formulations of
+          // this could not fit before carry #14 decomposed tickets/update; the decomposition is what
+          // makes this one line affordable. `'payment' in d` guards the absent-map case, which must DENY.
+          && (!(s.status == 'confirmed' && d.status == 'assigned')
+              || (d.jobType != 'drive_home' && 'ride' in d && d.ride.billTo != 'guest')
+              || ('payment' in d && d.payment.status in ['authorized', 'paid']));
+        // Fix round 2 (Plan 5 T2, controller ruling): the Ruling Z completed-floor line (just above the
+        // Plan 8 H1(b) block) is drive_home-only, and has NO
+        // passenger_ride equivalent anywhere — neither here nor in dispatch/onJobWritten.ts's
+        // completed-gate (a fix round 1 attempt briefly extended that gate to both job types; the
+        // controller reverted it). This is a deliberate PRODUCT scoping, not an expression-budget
+        // workaround: the plan's own T3 ride flow has no inspection step at all (Assigned -> pickup ->
+        // transit -> arrived -> Complete) — the spec's inspection gates are §5.2 drive-home specific,
+        // since a drive-home job puts a stranger behind the wheel of the GUEST'S OWN car (condition
+        // evidence matters before and after), while a passenger_ride uses a fleet vehicle with no
+        // equivalent liability shape. Gating ride the same way would make every ride impossible to
+        // complete, since nothing in that flow ever creates a post_drive damageReports doc for one.
+        // (This rule (transitionRequirements) is separately noted elsewhere in this file as sitting
+        // close to Firestore's ~1000-expression evaluation ceiling — true, but not why ride is
+        // excluded here; it simply has no floor to express.)
+      }
+      // server-owned / immutable top-level keys and nested keys
+      function ticketImmutableOk() {
+        return unchanged(['id', 'operatorId', 'venueId', 'jobType', 'guestToken', 'source', 'payment', 'pmsChargeSeq', 'metrics', 'parentTicketId'])
+          && subUnchanged('driveHome', ['quote', 'route', 'etaAt', 'destination']) && subUnchanged('ride', ['quote', 'route', 'etaAt', 'pickup', 'dropoff', 'passengers', 'billTo']);
+      }
+      function chaseStepOk(from, to) { return (from == 'pending' && to == 'following') || (from == 'following' && to == 'returning_driver') || (from == 'returning_driver' && to == 'done'); }
+      // Ruling V: the exact `times.*` key a status transition is allowed to touch — a status with no
+      // corresponding times field (e.g. 'retrieving', which has no schema key) maps to [] (times must
+      // stay unchanged on that transition). Prevents a transition write from backdating an unrelated
+      // times.* key (e.g. requestedAt) that Functions uses to compute retrieval-time KPIs.
+      function timesKeysForStatus(status) {
+        return status == 'requested' ? ['requestedAt']
+          : status == 'claimed' ? ['claimedAt']
+          : status == 'staged' ? ['stagedAt']
+          : status == 'ready' ? ['readyAt']
+          : status == 'delivered' ? ['deliveredAt']
+          : status == 'closed' ? ['closedAt']
+          : status == 'cancelled' ? ['cancelledAt']
+          : status == 'assigned' ? ['assignedAt']
+          : (status == 'en_route_to_guest' || status == 'en_route_to_pickup') ? ['enRouteAt']
+          : status == 'pre_drive_inspection' ? ['inspectionAt']
+          : status == 'in_transit' ? ['inTransitAt']
+          : (status == 'arrived' || status == 'arrived_pickup') ? ['arrivedAt']
+          : status == 'completed' ? ['completedAt']
+          : [];
+      }
+      // Ruling V: the `attendants.*` sub-key(s) a status transition is allowed to touch when the actor
+      // is not a manager — e.g. an attendant claiming a ticket may set claimedBy but not deliveredBy in
+      // the same write. Managers bypass this entirely (reassignment stays manager-only via isManager()).
+      function attendantsKeysForTransition(jobType, from, to) {
+        return (from == 'requested' && to == 'claimed') ? ['claimedBy']
+          : to == 'delivered' ? ['deliveredBy']
+          : (to == 'assigned' && jobType == 'drive_home') ? ['primaryDriverUid', 'chaseDriverUid']
+          : (to == 'assigned' && jobType == 'passenger_ride') ? ['primaryDriverUid']
+          : [];
+      }
+      function custodyVenueOk(op, ticketId) {
+        return inVenue(op, get(/databases/$(database)/documents/operators/$(op)/tickets/$(ticketId)).data.venueId);
+      }
+      // create uses getAfter(): the keyTags custody-batch flow creates the ticket and its first custodyEvent
+      // in the SAME batch, so the ticket may not exist pre-batch — getAfter() resolves the post-batch state.
+      function custodyVenueOkAfter(op, ticketId) {
+        return inVenue(op, getAfter(/databases/$(database)/documents/operators/$(op)/tickets/$(ticketId)).data.venueId);
+      }
+      function custodyActionValid(a) {
+        return a == 'checked_in' || a == 'keys_stored' || a == 'parked' || a == 'keys_taken' || a == 'moved' || a == 'retrieved'
+          || a == 'staged' || a == 'delivered' || a == 'keys_returned' || a == 'pre_drive_inspection' || a == 'post_drive_inspection'
+          || a == 'handoff_to_chase' || a == 'note';
+      }
+      function custodyCreateOk(op, ticketId, eventId) {
+        let uid = request.auth.uid;
+        return isUuid(eventId) && request.resource.data.id == eventId
+          && staffOf(op) && request.resource.data.actorUid == uid
+          && (isManager() || custodyVenueOkAfter(op, ticketId))
+          && custodyActionValid(request.resource.data.action)
+          && isIso(request.resource.data.at) && request.resource.data.deviceId is string;
+      }
+      match /tickets/{ticketId} {
+        allow get: if canReadTicket(op);
+        // LIST — rules are not filters: every branch constrains resource.data, so the query must carry the matching where() clause
+        allow list: if isPlatformAdmin()
+          || (inOperator(op) && isManager())
+          || (staffOf(op) && resource.data.venueId in venueIds())
+          || (inOperator(op) && hasRole(['venue_user']) && resource.data.venueId in venueIds())
+          || (isGuest() && resource.data.guest.uid == request.auth.uid)
+          || (isGuest() && 'phone_number' in claims() && resource.data.guest.phoneE164 == claims().phone_number)
+          // Ruling X: myClaimed/myPrimaryJobs/myChaseJobs — a staff self-query, provable on
+          // resource.data with no venue filter needed (the Queue/Jobs screens' "mine first" views).
+          || (inOperator(op) && staffOf(op) && resource.data.attendants.get('claimedBy', '') == request.auth.uid)
+          || (inOperator(op) && staffOf(op) && resource.data.attendants.get('primaryDriverUid', '') == request.auth.uid)
+          || (inOperator(op) && staffOf(op) && resource.data.attendants.get('chaseDriverUid', '') == request.auth.uid);
+        // Ruling V: the initial-status creator role set is tightened to exactly the TS state machine's
+        // `from: null` role list (owner/admin/lead/attendant — no bare 'driver', no 'venue_user' for a
+        // valet/checked_in ticket). venue_user (host portal) may still originate a drive_home/ride
+        // request, matching VALET/DRIVE_HOME/RIDE _RULES' shared `from: null` lists.
+        allow create: if validTicketShape(request.resource.data, op, ticketId) && initialStatusOk(request.resource.data)
+          && ( (hasRole(['owner', 'admin', 'lead', 'attendant']) && inVenue(op, request.resource.data.venueId) && request.resource.data.attendants.checkedInBy == request.auth.uid)
+             || (inOperator(op) && hasRole(['venue_user']) && request.resource.data.venueId in venueIds() && request.resource.data.source == 'host_portal' && request.resource.data.jobType != 'valet')
+             // Plan 8 D3 (carry #12, owner: block): a guest may not CREATE a new drive_home/ride under a
+             // suspended operator. Scoped strictly to creation — a guest whose car is already parked
+             // still retrieves and pays through branch 3 below, which never consults operator status,
+             // because suspension is a billing matter between us and the operator and must never strand
+             // a car. Inlined (same idiom as inOperator()'s gate) rather than a helper: the guest path
+             // does not compose through inOperator(), so this is the only other place it is needed.
+             || (isGuestOfPhone(request.resource.data) && request.resource.data.jobType != 'valet' && request.resource.data.source in ['guest_app', 'guest_web']
+                 && get(/databases/$(database)/documents/operators/$(op)).data.get('status', 'active') != 'suspended') );
+        // HISTORY (pre-#14): the five branches below were ONE `allow update` expression, which sat
+        // at Firestore's undocumented ~1000-expression-per-evaluation interpreter limit — Ruling C's
+        // suspension gate broke 4 baseline tests over it, four separate H1(b) formulations could not
+        // fit, and 49 assertFails() cases denied via the evaluation ERROR rather than a rules
+        // `false`. The decomposition note below records the split and the standing empirical
+        // protocol; inOperator()'s own comment near the top of this file keeps the original
+        // Ruling C writeup.
+        // #14 DECOMPOSITION (Plan 8 Task 9): what was one `allow update` with 5 ORed branches is
+        // now FIVE separate `allow update` statements, one per branch. Semantics are identical —
+        // Firestore grants if ANY allow statement grants — but each statement is evaluated as its
+        // own expression tree, so each gets its own ~1000-expression interpreter budget instead of
+        // all five branches (plus every helper they call) competing inside one. Before this split,
+        // 49 assertFails() cases in test/rules/*.test.ts were denying via the evaluation-ERROR
+        // mechanism ("maximum of 1000 expressions") rather than a rules-evaluated `false`
+        // (~101-109 such evaluations per full suite run, counted in firestore-debug.log), and four
+        // separate attempts to add a payment gate here tipped legitimate ALLOWs over the ceiling.
+        // The empirical protocol from the pre-split comment still applies to any change to a
+        // BRANCH or to inOperator()/staffOf()/venueMatch(): run test:rules before and after, diff
+        // the full per-test list, and grep firestore-debug.log for "maximum of 1000 expressions" —
+        // see task-9's report for the measured before/after figures.
+
+        // STATEMENT ORDER AND CONJUNCT ORDER ARE LOAD-BEARING (#14): the interpreter's
+        // ~1000-expression budget is PER REQUEST — cumulative across every allow statement it
+        // evaluates (verified empirically: once one statement exhausts it, every later statement
+        // errors immediately, even a trivially cheap one — and a granting evaluation measured
+        // within ~40 expressions of the ceiling flipped to DENY when ~40 expressions of cheap
+        // statement rejections were put in front of it; both runs in task-9's report). Ordering
+        // rules that follow from that: branch 1 stays FIRST (its first conjunct rejects every
+        // non-transition write in a handful of expressions, and transition GRANTS — the budget's
+        // biggest legitimate spender — must not pay for other statements' rejections first), and
+        // within every statement the cheapest discriminating conjuncts come first with
+        // ticketImmutableOk() / transitionRequirements() last, so a request that isn't the
+        // branch's shape exits within a few expressions.
+
+// Branch 1 — status transition by venue staff / managers / platform. Ruling V: co-edits
+        // constrained to exactly the fields a transition legitimately needs (metric-gaming,
+        // provenance-rewrite, and evidence-unlinking co-edits are impossible in the same write as a
+        // status change; guest.* edits go only through branch 2). Deliberately the FIRST statement:
+        // transition grants are the budget's biggest legitimate cost and must not pay other
+        // statements' rejections first; its own first conjunct rejects non-transitions cheaply.
+        allow update: if request.resource.data.status != resource.data.status
+          // Ruling C: venueMatch, not inVenue — inOperator(op) is already an explicit sibling
+          // conjunct right here, so inVenue()'s own redundant inOperator() re-check is pure waste.
+          // Plan 8 D2 (carry #13, owner: restrict): this used to read `(isManager() || venueMatch(...))`,
+          // which let a LEAD transition any venue's tickets while branch 2 below already venue-scoped a
+          // lead's reassignments. venueMatch() admits owner/admin through its own isAdmin() arm, so
+          // dropping the escape changes exactly one role: a lead at one property can no longer move
+          // another property's cars. Also one fewer expression on the budget-bound statement.
+          && (isPlatformAdmin() || (inOperator(op) && venueMatch(op, ticketVenue())))
+          && allowedTransition(resource.data.jobType, resource.data.status, request.resource.data.status)
+          && (isPlatformAdmin() || roleMayTransition(resource.data.jobType, resource.data.status, request.resource.data.status, isClaimant()))
+          && onlyChanged(['status', 'times', 'attendants', 'cancelReason', 'lastCustodyEventId'])
+          && subOnly('times', timesKeysForStatus(request.resource.data.status))
+          && (isPlatformAdmin() || isManager() || subOnly('attendants', attendantsKeysForTransition(resource.data.jobType, resource.data.status, request.resource.data.status)))
+          && ticketImmutableOk()
+          && transitionRequirements(op, ticketId);
+
+// Branch 2 — non-status edits by venue staff on active tickets (reassignment manager-only).
+        // (status-unchanged first: rejects every transition write in ~3 expressions.)
+        // Ruling V/finding 13: keyTagId and lastCustodyEventId are excluded — set at create (coupled
+        // keyTags assign batch) or via branch 1's custody-batch transitions, never free-standing.
+        // Binding a REPLACEMENT tag to an existing ticket is Functions-only (re-review N2).
+        // Ruling C: venueMatch, not inVenue — staffOf(op) already includes inOperator(op).
+        allow update: if request.resource.data.status == resource.data.status
+          && staffOf(op) && venueMatch(op, ticketVenue())
+          && !(resource.data.status in ['closed', 'cancelled'])
+          && onlyChanged(['vehicle', 'zoneId', 'spotLabel', 'flags', 'guest', 'damageReportIds', 'incidentIds', 'hostRequest', 'attendants'])   // Plan 8 #19: shiftId deleted (zero writers/readers; tipPool windows by deliveredAt on purpose)
+          && subOnly('guest', ['name', 'room', 'reservationRef', 'consentSms'])
+          && (!mapChanged('attendants') || isManager())
+          && ticketImmutableOk();
+
+// Branch 3 — guest: request / cancel / confirm quotes / flags. (isGuestOf's isGuest()
+        // check rejects every staff request in a few expressions.)
+        allow update: if isGuestOf(resource.data)
+          && ( (request.resource.data.status != resource.data.status
+                 && allowedTransition(resource.data.jobType, resource.data.status, request.resource.data.status)
+                 && roleMayTransition(resource.data.jobType, resource.data.status, request.resource.data.status, false)
+                 && onlyChanged(['status', 'times', 'cancelReason', 'driveHome'])
+                 && subOnly('times', ['requestedAt', 'cancelledAt'])
+                 && subOnly('driveHome', ['termsAcceptedAt', 'termsVersion'])
+                 && transitionRequirements(op, ticketId))
+             || (onlyChanged(['flags']) && subOnly('flags', ['assistance', 'accessibleVehicle'])) )
+          && ticketImmutableOk();
+
+// Branch 4 — venue_user: request car from the host portal. (venue_user role check first:
+        // rejects every staff/guest request in ~5 expressions.)
+        allow update: if hasRole(['venue_user'])
+          && request.resource.data.status == 'requested' && resource.data.status == 'checked_in'
+          && inOperator(op) && ticketVenue() in venueIds()
+          && onlyChanged(['status', 'times', 'hostRequest'])
+          && subOnly('times', ['requestedAt'])
+          && ticketImmutableOk();
+
+// Branch 5 — chase driver advances the chase sub-status only. (chase-uid match first:
+        // rejects everyone but the one assigned chase driver immediately.)
+        allow update: if resource.data.attendants.get('chaseDriverUid', '') == request.auth.uid
+          && staffOf(op)
+          && onlyChanged(['driveHome'])
+          && subOnly('driveHome', ['chase'])
+          && chaseStepOk(resource.data.driveHome.chase.status, request.resource.data.driveHome.chase.status)
+          && ticketImmutableOk();
+
+        allow delete: if false;
+      }
+
+      match /tickets/{ticketId}/custodyEvents/{eventId} {
+        allow read: if isPlatformAdmin() || (inOperator(op) && (isManager() || custodyVenueOk(op, ticketId))) || resource.data.actorUid == request.auth.uid;
+        allow create: if createOnly() && custodyCreateOk(op, ticketId, eventId);
+        allow update, delete: if false;
+      }
+
+      // ---------- damage reports + photos ----------
+      // Ruling W: the referenced ticket's venue AND its lifecycle phase gate updates — chain-of-custody
+      // evidence must be venue-scoped like create already is, and frozen once the ticket is
+      // closed/cancelled (a claim may be in adjudication against a closed ticket's evidence).
+      function damageReportTicketOk(op, ticketId) {
+        let t = get(/databases/$(database)/documents/operators/$(op)/tickets/$(ticketId)).data;
+        return inVenue(op, t.venueId) && !(t.status in ['closed', 'cancelled']);
+      }
+      match /damageReports/{reportId} {
+        allow read: if isPlatformAdmin() || (inOperator(op) && (isManager() || inVenue(op, get(/databases/$(database)/documents/operators/$(op)/tickets/$(resource.data.ticketId)).data.venueId)));
+        // Ruling J: getAfter, not get — a damage report created in the SAME batch as its ticket
+        // (Plan 2b's atomic check-in commit) must see the ticket's post-write state, since get()
+        // reads only what's already committed and the ticket doesn't exist there yet. getAfter()
+        // is safe for the standalone case too: for a ticket untouched by this batch, "after" is
+        // just its current server state, identical to what get() would have returned.
+        allow create: if staffOf(op) && isUuid(reportId) && request.resource.data.id == reportId && request.resource.data.operatorId == op && request.resource.data.createdBy == request.auth.uid
+          && inVenue(op, getAfter(/databases/$(database)/documents/operators/$(op)/tickets/$(request.resource.data.ticketId)).data.venueId)
+          && request.resource.data.phase in ['check_in', 'check_out', 'pre_drive', 'post_drive', 'incident'] && !('photoCount' in request.resource.data);
+        allow update: if staffOf(op) && onlyChanged(['diagramMarks', 'notes', 'vehicleSnapshot']) && damageReportTicketOk(op, resource.data.ticketId);
+        allow delete: if false;
+        match /photos/{photoId} {
+          allow read: if isPlatformAdmin() || staffOf(op);
+          allow create: if createOnly() && staffOf(op) && isUuid(photoId) && request.resource.data.id == photoId && request.resource.data.actorUid == request.auth.uid
+            // Plan 8 carry #57: the ticket segment was any uuid (`[0-9a-f-]{36}`), so a photo doc under
+            // report A could point at a storage object filed under ticket B. Bound to the parent report's
+            // own ticketId — the report doc carries it, and a get() is affordable here, outside the
+            // budget-bound tickets/update rule. getAfter for the same reason as the report create above
+            // (Ruling J): safe whether or not the report landed in this batch. Mobile builds the path
+            // from the report's ticket (create-report.ts, commit.ts), so legitimate uploads are unchanged.
+            && request.resource.data.storagePath == 'operators/' + op + '/tickets/' + getAfter(/databases/$(database)/documents/operators/$(op)/damageReports/$(reportId)).data.ticketId + '/photos/' + photoId + '.jpg'
+            && request.resource.data.bytes is int && request.resource.data.bytes > 0 && request.resource.data.bytes <= 10485760
+            && request.resource.data.stage in ['wide', 'medium', 'close', 'diagram'] && request.resource.data.sha256.matches('^[a-f0-9]{64}$');
+          allow update, delete: if false;
+        }
+      }
+
+      // ---------- incidents ----------
+      match /incidents/{incidentId} {
+        allow read: if isPlatformAdmin() || (inOperator(op) && (isManager() || resource.data.reportedBy == request.auth.uid || inVenue(op, resource.data.venueId)));
+        allow create: if staffOf(op) && isUuid(incidentId) && request.resource.data.id == incidentId && request.resource.data.operatorId == op && request.resource.data.reportedBy == request.auth.uid && inVenue(op, request.resource.data.venueId);
+        // Ruling U (2c mobile review, Critical): the outbox photo uploader appends incident photos via
+        // updateDoc(..., { photos: arrayUnion(storagePath) }) as the ORIGINAL REPORTER, not a manager —
+        // without this branch the JPEG lands durably in Storage but the Firestore append is permanently
+        // denied, stranding the outbox item in needs_attention forever. Scoped tight: reporter-only, own
+        // incident only, photos-only (onlyChanged — id/operatorId/reportedBy/at are untouchable exactly
+        // like the manager branch, for free, since they're excluded from the allowed key set), and
+        // append-only (photos strictly grows) — a reporter can never touch any other field or
+        // shrink/replace the photos list.
+        allow update: if isPlatformAdmin() || (inOperator(op) && isManager() && unchanged(['id', 'operatorId', 'reportedBy', 'at']))
+          || (staffOf(op) && resource.data.reportedBy == request.auth.uid && onlyChanged(['photos']) && request.resource.data.photos.size() > resource.data.photos.size());
+        allow delete: if false;
+      }
+
+      // ---------- claims (workflow docs editable by admins; evidence bundle Functions-only) ----------
+      match /claims/{claimId} {
+        allow read: if isPlatformAdmin() || (inOperator(op) && isManager());
+        allow create: if (isPlatformAdmin() || (inOperator(op) && isAdmin())) && !('evidenceBundle' in request.resource.data);
+        allow update: if (isPlatformAdmin() || (inOperator(op) && isAdmin())) && unchanged(['evidenceBundle', 'ticketId', 'operatorId']);
+        allow delete: if false;
+      }
+
+      // ---------- validations / hostRequests ----------
+      match /validations/{validationId} {
+        allow read: if isPlatformAdmin() || (inOperator(op) && (isManager() || inVenue(op, resource.data.venueId) || (hasRole(['venue_user']) && resource.data.venueId in venueIds())));
+        allow create: if inOperator(op) && request.resource.data.issuedBy == request.auth.uid && (isAdmin() || (hasRole(['venue_user', 'lead']) && request.resource.data.venueId in venueIds()));
+        // Ruling P (Plan 7 T1): redemption is Functions-only — the old staff branch let a client
+        // set `redeemedTicketId` directly, which bypassed the shared transactional redemption
+        // guard (venue/validation.ts's redeemValidation: the ONE path, per Ruling F) and produced
+        // a half-redeemed state: no `payment.validationId`/`validationAmount` ever applied to the
+        // ticket (so the next checkout silently charged full price), no `redemption {amount,
+        // base, at}` group, and no `processedEvents/val_{id}` marker for the POS mutual-exclusion
+        // (Task 3). Admins keep an update path for operational edits (e.g. expiring a code) but
+        // the identity and redemption state are pinned — `redeemedTicketId`/`redemption` can now
+        // ONLY be written by the Admin SDK. T3 review L1 added `posPush` to the pin: it is the
+        // POS push CLAIM (H1) — a client write that deleted or rewrote it would re-arm
+        // posApplyValidation's retry path and land a second discount for an already-applied code.
+        allow update: if inOperator(op) && isAdmin()
+          && unchanged(['id', 'operatorId', 'venueId', 'code', 'type', 'amount', 'rateId', 'issuedBy', 'issuedAt', 'redeemedTicketId', 'redemption', 'posPush']);
+        allow delete: if false;
+      }
+      match /hostRequests/{id} {
+        allow read: if isPlatformAdmin() || (inOperator(op) && (isManager() || inVenue(op, resource.data.venueId) || (hasRole(['venue_user']) && resource.data.venueId in venueIds())));
+        // Ruling W (finding 10): by==self is required for EVERY creator, admins included — an admin
+        // acting operator-wide (no venueIds-claim requirement) may still never forge someone else's `by`.
+        allow create: if inOperator(op) && request.resource.data.by == request.auth.uid
+          && ( (hasRole(['venue_user', 'lead', 'admin', 'owner']) && request.resource.data.venueId in venueIds()) || isAdmin() );
+        // Ruling W: venue-scoped like every other venue-owned collection's update — a staff member of
+        // another venue could otherwise match/dismiss a host request that isn't theirs to act on.
+        allow update: if inOperator(op) && (isManager() || staffOf(op)) && onlyChanged(['status', 'ticketId']) && inVenue(op, resource.data.venueId);
+        allow delete: if false;
+      }
+
+      // ---------- live locations ----------
+      // Ruling AB (finding 11): the old primary/chase disjunct was written across && lines with a
+      // trailing || — operator precedence made the chase branch skip the geo/ticketId shape checks
+      // entirely. One helper now applies the same shape checks and requires the referenced ticket be on
+      // an active (non-terminal) job for BOTH roles, with a single get() call.
+      function liveLocationWriteOk(op, ticketId, uid) {
+        let t = get(/databases/$(database)/documents/operators/$(op)/tickets/$(ticketId)).data;
+        return !(t.status in ['closed', 'cancelled']) && (t.attendants.get('primaryDriverUid', '') == uid || t.attendants.get('chaseDriverUid', '') == uid);
+      }
+      match /liveLocations/{uid} {
+        // readable by managers and by staff/venue users of the job's venue; writable only by the driver on that active job
+        allow read: if isPlatformAdmin() || (inOperator(op) && (isManager() || inVenue(op, get(/databases/$(database)/documents/operators/$(op)/tickets/$(resource.data.ticketId)).data.venueId)
+                      || (hasRole(['venue_user']) && get(/databases/$(database)/documents/operators/$(op)/tickets/$(resource.data.ticketId)).data.venueId in venueIds())));
+        allow write: if staffOf(op) && request.auth.uid == uid && request.resource.data.geo.lat is number && request.resource.data.geo.lng is number
+                      && request.resource.data.ticketId is string
+                      && liveLocationWriteOk(op, request.resource.data.ticketId, uid);
+      }
+
+      // ---------- integrations (non-secret config by owner; status/secretRef/health/lastError/lastErrorAt Functions-only) ----------
+      match /integrations/{provider} {
+        allow read: if isPlatformAdmin() || (inOperator(op) && isAdmin());
+        // Ruling AB (finding 12): the comment always said status/secretRef/health were Functions-only —
+        // the rule only ever locked secretRef/health/lastSyncAt. Lock status and lastError too so the
+        // rule matches its own documented intent; Functions set the initial status after onboarding.
+        // Final-wave item 10: `lastErrorAt` (healthCheck.ts/sync.ts both write it alongside
+        // `lastError`) was missed by that same lock — closed here so a client can't forge/clear the
+        // error timestamp any more than it could the error message itself.
+        allow create, update: if (isPlatformAdmin() || (inOperator(op) && isOwner()))
+          && !('status' in request.resource.data) && !('secretRef' in request.resource.data) && !('health' in request.resource.data)
+          && !('lastSyncAt' in request.resource.data) && !('lastError' in request.resource.data) && !('lastErrorAt' in request.resource.data);
+        allow delete: if isPlatformAdmin() || (inOperator(op) && isOwner());
+      }
+
+      // ---------- rotating OAuth credentials: Functions-only, NEVER client-readable ----------
+      // Unlike `integrations/{provider}` above — which an operator admin MAY read — this holds a
+      // live bearer credential (QuickBooks' rotating refresh token). No client role reads it, not
+      // even platform_admin: nothing in any UI needs its value, and the blast radius of a leak is
+      // the operator's entire QuickBooks company file. Written only by Functions via the Admin
+      // SDK, which bypasses rules entirely. See `integrationTokenSchema`.
+      match /integrationTokens/{provider} { allow read, write: if false; }
+      // Plan 8 Task 5 (carry #4): refund-recompute markers, written by applyEvent.ts and consumed
+      // by the metrics sweep. Admin SDK only; nothing a client should ever see or touch.
+      match /metricsRecompute/{txId} { allow read, write: if false; }
+
+      // ---------- Functions-only (client read for admins) ----------
+      match /transactions/{id} { allow read: if isPlatformAdmin() || (inOperator(op) && (isAdmin() || (hasRole(['lead']) && resource.data.venueId in venueIds()))); allow write: if false; }   // attendants see payment summary on the ticket only; leads are venue-scoped (Ruling S)
+      match /payoutBatches/{id} { allow read: if isPlatformAdmin() || (inOperator(op) && isAdmin()); allow write: if false; }
+      match /invoices/{id} { allow read: if isPlatformAdmin() || (inOperator(op) && (isAdmin() || (hasRole(['venue_user']) && resource.data.venueId in venueIds()))); allow write: if false; }
+      // Plan 8 carry #44: venue_user REMOVED from this read. The rollup document is operator-shaped —
+      // every venue's bucket plus the operator aggregate — and a client cannot partially read a
+      // document, so any venue_user read here shipped sibling venues' numbers to one hotel's front
+      // desk. The venue portal now reads analyticsSummary (v0.4.6, server-filtered to the caller's
+      // venue); that read path landed first (transportation c8351c8) so tightening here blanks nothing.
+      match /metrics/{kind}/days/{day} { allow read: if isPlatformAdmin() || (inOperator(op) && isManager()); allow write: if false; }
+      match /metrics/forecast/weeks/{week} { allow read: if isPlatformAdmin() || (inOperator(op) && isManager()); allow write: if false; }   // Plan 4b T7 forecasting
+      match /auditLog/{id} { allow read: if isPlatformAdmin() || (inOperator(op) && isAdmin()); allow write: if false; }
+      match /archive/{rest=**} { allow read, write: if false; } // Functions-only (Admin SDK bypasses rules); no client surface by design (Ruling R)
+
+    // BEGIN GENERATED TRANSITIONS (npm run rules:generate)
+    function allowedTransition(jobType, from, to) {
+      return (jobType == 'valet' && ((from == 'checked_in' && to == 'requested') || (from == 'requested' && to == 'claimed') || (from == 'requested' && to == 'staged') || (from == 'requested' && to == 'checked_in') || (from == 'claimed' && to == 'retrieving') || (from == 'retrieving' && to == 'ready') || (from == 'staged' && to == 'ready') || (from == 'retrieving' && to == 'staged') || (from == 'ready' && to == 'delivered') || (from == 'delivered' && to == 'closed') || (from == 'checked_in' && to == 'cancelled') || (from == 'requested' && to == 'cancelled') || (from == 'claimed' && to == 'cancelled') || (from == 'retrieving' && to == 'cancelled') || (from == 'staged' && to == 'cancelled') || (from == 'ready' && to == 'cancelled') || (from == 'delivered' && to == 'cancelled')))
+        || (jobType == 'drive_home' && ((from == 'requested' && to == 'quoted') || (from == 'quoted' && to == 'confirmed') || (from == 'confirmed' && to == 'assigned') || (from == 'assigned' && to == 'en_route_to_guest') || (from == 'en_route_to_guest' && to == 'pre_drive_inspection') || (from == 'pre_drive_inspection' && to == 'in_transit') || (from == 'in_transit' && to == 'arrived') || (from == 'arrived' && to == 'completed') || (from == 'completed' && to == 'closed') || (from == 'requested' && to == 'cancelled') || (from == 'quoted' && to == 'cancelled') || (from == 'confirmed' && to == 'cancelled') || (from == 'assigned' && to == 'cancelled') || (from == 'en_route_to_guest' && to == 'cancelled') || (from == 'pre_drive_inspection' && to == 'cancelled') || (from == 'in_transit' && to == 'cancelled') || (from == 'arrived' && to == 'cancelled')))
+        || (jobType == 'passenger_ride' && ((from == 'requested' && to == 'quoted') || (from == 'quoted' && to == 'confirmed') || (from == 'confirmed' && to == 'assigned') || (from == 'assigned' && to == 'en_route_to_pickup') || (from == 'en_route_to_pickup' && to == 'arrived_pickup') || (from == 'arrived_pickup' && to == 'in_transit') || (from == 'in_transit' && to == 'arrived') || (from == 'arrived' && to == 'completed') || (from == 'completed' && to == 'closed') || (from == 'requested' && to == 'cancelled') || (from == 'quoted' && to == 'cancelled') || (from == 'confirmed' && to == 'cancelled') || (from == 'assigned' && to == 'cancelled') || (from == 'en_route_to_pickup' && to == 'cancelled') || (from == 'arrived_pickup' && to == 'cancelled') || (from == 'in_transit' && to == 'cancelled') || (from == 'arrived' && to == 'cancelled')));
+    }
+    function roleMayTransition(jobType, from, to, isClaimant) {
+      return (jobType == 'valet' && ((from == 'checked_in' && to == 'requested' && (roles().hasAny(["owner","admin","lead","attendant","guest","venue_user","platform_admin"]))) || (from == 'requested' && to == 'claimed' && (roles().hasAny(["owner","admin","lead","attendant"]))) || (from == 'requested' && to == 'staged' && (roles().hasAny(["owner","admin","lead","attendant"]))) || (from == 'requested' && to == 'checked_in' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'claimed' && to == 'retrieving' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["attendant","driver"])))) || (from == 'retrieving' && to == 'ready' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["attendant","driver"])))) || (from == 'staged' && to == 'ready' && (roles().hasAny(["owner","admin","lead","attendant"]))) || (from == 'retrieving' && to == 'staged' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["attendant","driver"])))) || (from == 'ready' && to == 'delivered' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["attendant","driver"])))) || (from == 'delivered' && to == 'closed' && (roles().hasAny(["owner","admin","lead","attendant","platform_admin"]))) || (from == 'checked_in' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'requested' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'claimed' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'retrieving' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'staged' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'ready' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'delivered' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"])))))
+        || (jobType == 'drive_home' && ((from == 'requested' && to == 'quoted' && (roles().hasAny(["platform_admin"]))) || (from == 'quoted' && to == 'confirmed' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'confirmed' && to == 'assigned' && (roles().hasAny(["owner","admin","lead","platform_admin"]))) || (from == 'assigned' && to == 'en_route_to_guest' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'en_route_to_guest' && to == 'pre_drive_inspection' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'pre_drive_inspection' && to == 'in_transit' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'in_transit' && to == 'arrived' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'arrived' && to == 'completed' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'completed' && to == 'closed' && (roles().hasAny(["owner","admin","lead","platform_admin"]))) || (from == 'requested' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest"]))) || (from == 'quoted' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest"]))) || (from == 'confirmed' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest"]))) || (from == 'assigned' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest"]))) || (from == 'en_route_to_guest' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest"]))) || (from == 'pre_drive_inspection' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest"]))) || (from == 'in_transit' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'arrived' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"])))))
+        || (jobType == 'passenger_ride' && ((from == 'requested' && to == 'quoted' && (roles().hasAny(["platform_admin"]))) || (from == 'quoted' && to == 'confirmed' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'confirmed' && to == 'assigned' && (roles().hasAny(["owner","admin","lead","platform_admin"]))) || (from == 'assigned' && to == 'en_route_to_pickup' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'en_route_to_pickup' && to == 'arrived_pickup' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'arrived_pickup' && to == 'in_transit' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'in_transit' && to == 'arrived' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'arrived' && to == 'completed' && (roles().hasAny(["owner","admin","lead"]) || (isClaimant && roles().hasAny(["driver"])))) || (from == 'completed' && to == 'closed' && (roles().hasAny(["owner","admin","lead","platform_admin"]))) || (from == 'requested' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest","venue_user"]))) || (from == 'quoted' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest","venue_user"]))) || (from == 'confirmed' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest","venue_user"]))) || (from == 'assigned' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest","venue_user"]))) || (from == 'en_route_to_pickup' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest","venue_user"]))) || (from == 'arrived_pickup' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead","guest","venue_user"]))) || (from == 'in_transit' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"]))) || (from == 'arrived' && to == 'cancelled' && (roles().hasAny(["owner","admin","lead"])))));
+    }
+    // END GENERATED TRANSITIONS
+    }
+  }
+}

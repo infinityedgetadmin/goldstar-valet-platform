@@ -1,0 +1,28 @@
+{
+  "routes": [
+    {
+      "weight_name": "auto",
+      "weight": 620.4,
+      "duration": 542.3,
+      "distance": 3820.5,
+      "geometry": "ojmyJdazkC_ByEwHqDaDcC",
+      "legs": [
+        {
+          "via_waypoints": [],
+          "summary": "S Illinois St, W Washington St",
+          "admins": [{ "iso_3166_1_alpha3": "USA", "iso_3166_1": "US" }],
+          "weight": 620.4,
+          "duration": 542.3,
+          "steps": [],
+          "distance": 3820.5
+        }
+      ]
+    }
+  ],
+  "waypoints": [
+    { "name": "S Illinois St", "location": [-86.158, 39.765], "distance": 5.2 },
+    { "name": "N Tacoma Ave", "location": [-86.15, 39.85], "distance": 3.1 }
+  ],
+  "code": "Ok",
+  "uuid": "fixture-directions-uuid"
+}

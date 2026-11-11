@@ -1,0 +1,9 @@
+{
+  "token": {
+    "tokenType": "Bearer",
+    "scope": "orders:read orders:write",
+    "expiresIn": 86400,
+    "accessToken": "test-access-token-abc123"
+  },
+  "status": "SUCCESS"
+}

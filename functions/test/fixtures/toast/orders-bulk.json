@@ -1,0 +1,62 @@
+[
+  {
+    "guid": "11111111-1111-1111-1111-111111111111",
+    "entityType": "Order",
+    "businessDate": 20260830,
+    "voided": false,
+    "table": { "guid": "aaaaaaaa-0000-0000-0000-000000000001", "entityType": "Table" },
+    "checks": [
+      {
+        "guid": "22222222-2222-2222-2222-222222222222",
+        "entityType": "Check",
+        "displayNumber": "12",
+        "tabName": "Table 12",
+        "voided": false,
+        "closedDate": null,
+        "paymentStatus": "OPEN",
+        "amount": 84.5,
+        "totalAmount": 91.25,
+        "openedDate": "2026-08-30T19:05:00.000+0000",
+        "appliedDiscounts": [],
+        "selections": []
+      },
+      {
+        "guid": "33333333-3333-3333-3333-333333333333",
+        "entityType": "Check",
+        "displayNumber": "13",
+        "tabName": null,
+        "voided": false,
+        "closedDate": "2026-08-30T19:40:00.000+0000",
+        "paymentStatus": "CLOSED",
+        "amount": 20,
+        "totalAmount": 21.4,
+        "openedDate": "2026-08-30T18:00:00.000+0000",
+        "appliedDiscounts": [],
+        "selections": []
+      }
+    ]
+  },
+  {
+    "guid": "44444444-4444-4444-4444-444444444444",
+    "entityType": "Order",
+    "businessDate": 20260830,
+    "voided": true,
+    "table": null,
+    "checks": [
+      {
+        "guid": "55555555-5555-5555-5555-555555555555",
+        "entityType": "Check",
+        "displayNumber": "12",
+        "tabName": "Table 12",
+        "voided": false,
+        "closedDate": null,
+        "paymentStatus": "OPEN",
+        "amount": 10,
+        "totalAmount": 10.7,
+        "openedDate": "2026-08-30T19:10:00.000+0000",
+        "appliedDiscounts": [],
+        "selections": []
+      }
+    ]
+  }
+]

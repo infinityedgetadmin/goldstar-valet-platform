@@ -1,0 +1,8 @@
+{
+  "_comment": "MOCK SEED data for MockPmsProvider — invented by us, deliberately NOT a recording of any OHIP response (Ruling H: recording one would freeze an unverified contract). Includes a noPost:true reservation so both venue.pms.noPostBehavior branches are exercisable.",
+  "reservations": [
+    { "reservationRef": "res_100", "guestName": "Avery Sample", "room": "412", "arrival": "2026-08-22", "departure": "2026-08-25", "noPost": false },
+    { "reservationRef": "res_101", "guestName": "Jordan Nopost", "room": "907", "arrival": "2026-08-23", "departure": "2026-08-24", "noPost": true },
+    { "reservationRef": "res_102", "guestName": "Sam Checkout", "room": "115", "noPost": false }
+  ]
+}

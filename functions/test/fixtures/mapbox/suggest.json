@@ -1,0 +1,34 @@
+{
+  "suggestions": [
+    {
+      "name": "St. Elmo Steak House",
+      "mapbox_id": "dXJuOm1ieHNiOnN0LWVsbW8tc3RlYWtob3VzZQ",
+      "feature_type": "poi",
+      "address": "127 S Illinois St",
+      "full_address": "127 S Illinois St, Indianapolis, Indiana 46225, United States",
+      "place_formatted": "Indianapolis, Indiana 46225, United States",
+      "language": "en",
+      "maki": "restaurant",
+      "poi_category": ["restaurant", "food and drink"],
+      "poi_category_ids": ["restaurant", "food_and_drink"],
+      "external_ids": {},
+      "metadata": {}
+    },
+    {
+      "name": "St. Elmo Family Dentistry",
+      "mapbox_id": "dXJuOm1ieHNiOnN0LWVsbW8tZGVudGFsLWNhcmU",
+      "feature_type": "poi",
+      "address": "5333 N Tacoma Ave",
+      "full_address": "5333 N Tacoma Ave, Indianapolis, Indiana 46220, United States",
+      "place_formatted": "Indianapolis, Indiana 46220, United States",
+      "language": "en",
+      "maki": "dentist",
+      "poi_category": ["dentist", "health services"],
+      "poi_category_ids": ["dentist", "health_services"],
+      "external_ids": {},
+      "metadata": {}
+    }
+  ],
+  "attribution": "© 2026 Mapbox and its suppliers. All rights reserved. Use of this data is subject to the Mapbox Terms of Service. (https://www.mapbox.com/about/maps/)",
+  "response_id": "fixture-suggest-response-id"
+}

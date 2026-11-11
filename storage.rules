@@ -1,0 +1,134 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function roles() { return signedIn() && 'roles' in request.auth.token ? request.auth.token.roles : []; }
+    // Ruling P: mirror firestore.rules' notExpiredAssumption() exactly (same field, same comparison
+    // operator/operand) so a role-assumption token that has expired is rejected identically by both
+    // services — a client can't keep write access to Storage after Firestore has revoked it.
+    function notExpiredAssumption() { return !('assumedUntil' in request.auth.token) || request.auth.token.assumedUntil > request.time.toMillis(); }
+    function inOperator(op) { return signedIn() && request.auth.token.operatorId == op && notExpiredAssumption(); }
+    function isPlatformAdmin() { return roles().hasAny(['platform_admin']); }
+    function isAdmin() { return roles().hasAny(['owner', 'admin']); }
+    function isManager() { return roles().hasAny(['owner', 'admin', 'lead']); }
+    function staff(op) { return inOperator(op) && roles().hasAny(['owner', 'admin', 'lead', 'attendant', 'driver']); }
+    // Ruling F-4a (final-review F2): mirrors firestore.rules' Ruling C suspended-operator gate into
+    // Storage. Deliberately NOT folded into inOperator()/staff() themselves (which would silently
+    // compound with every read already spent by inVenueOfTicket()/inVenueOfIncident()'s >=20-venueIds
+    // fallback below and blow the 2-unique-document-per-evaluation cap Storage Rules enforce on
+    // firestore.get()/exists() — confirmed against Firebase's current docs, not assumed). Applied
+    // per-callsite instead, only where the existing read budget has headroom.
+    function operatorActive(op) {
+      return firestore.get(/databases/(default)/documents/operators/$(op)).data.get('status', 'active') != 'suspended';
+    }
+    function venueIds() { return signedIn() && 'venueIds' in request.auth.token ? request.auth.token.venueIds : []; }
+    // Cross-service lookup: ticket photos are venue-scoped, but the storage object path only carries
+    // the ticket id, not its venue. Fetch the ticket from Firestore (mirrors firestore.rules' inVenue())
+    // so a staff member outside the ticket's venue can't read/write its photos. Managers bypass, same
+    // as firestore.rules' isManager() bypass on canReadTicket()/ticket updates.
+    function ticketVenueId(op, ticketId) {
+      return firestore.get(/databases/(default)/documents/operators/$(op)/tickets/$(ticketId)).data.venueId;
+    }
+    // Ruling O: parity with firestore.rules' inVenue() ≥20-venueIds fallback — a token capped at 20
+    // venue ids falls back to the full venueIds list on the user doc (second Firestore read; two
+    // reads is the documented per-evaluation cap for Storage Rules, so this is the worst case).
+    //
+    // Ruling F-4a (final-review F2): the manager-bypass and direct-venueIds branches below gain
+    // operatorActive(op) — each still fits the 2-document cap (manager: 1 read [operator], cached
+    // across re-checks; direct match: 2 reads [ticket for `vid`, then operator]). The FINAL (fallback)
+    // branch is deliberately left ungated: by the time evaluation reaches it, `vid` (ticket doc) has
+    // already been read to fail the direct-venueIds branch, so adding the fallback's own user-doc read
+    // already spends the full 2-document budget (ticket + user) — a third (operator) read here would
+    // overflow the cap and hard-deny the request outright, for active and suspended operators alike,
+    // rather than narrowing denial to suspended ones. Accepted gap: an attendant/driver whose token is
+    // capped at 20 venueIds (assigned to 20+ venues) keeps ticket-photo access via this fallback branch
+    // for the window between their operator being suspended and their token naturally expiring or
+    // refreshing. Every other branch/path in this file enforces suspension immediately. (A manager
+    // hitting this same fallback while suspended is still denied in practice — their operatorActive()
+    // read in the first branch above, plus the ticket read in the second, already reach 2 documents
+    // before the fallback's user-doc read would be a 3rd, so the evaluation errors closed rather than
+    // granting.)
+    // Plan 8 Task 10 (#8): the fallback branch's suspension check now comes off the TOKEN —
+    // `operatorSuspended`, a claims bit identity/claims.handler.ts sets from the parent operator doc
+    // and platform/setStatus.ts fans out to every user on suspend/reactivate — at zero document
+    // cost, which is the only budget this branch has left. The accepted gap described above shrinks
+    // from "until the token naturally expires" to "until the client's next token refresh", which the
+    // claimsVersion bump makes immediate for a live session.
+    function operatorSuspendedOnToken() { return request.auth.token.get('operatorSuspended', false) == true; }
+    function inVenueOfTicket(op, ticketId) {
+      let vid = ticketVenueId(op, ticketId);
+      return (isManager() && operatorActive(op)) || (vid in venueIds() && operatorActive(op))
+        || (venueIds().size() >= 20 && !operatorSuspendedOnToken() && vid in firestore.get(/databases/(default)/documents/operators/$(op)/users/$(request.auth.uid)).data.venueIds);
+    }
+    // Ruling Q: incidents are venue-scoped exactly like ticket photos — same cross-service lookup,
+    // manager bypass, and ≥20-venueIds fallback. A missing incident doc fails closed (intended).
+    function incidentVenueId(op, incidentId) {
+      return firestore.get(/databases/(default)/documents/operators/$(op)/incidents/$(incidentId)).data.venueId;
+    }
+    // Ruling F-4a: same suspended-operator gate and same accepted fallback-path gap as
+    // inVenueOfTicket() above — identical read-budget reasoning applies verbatim.
+    function inVenueOfIncident(op, incidentId) {
+      let vid = incidentVenueId(op, incidentId);
+      return (isManager() && operatorActive(op)) || (vid in venueIds() && operatorActive(op))
+        || (venueIds().size() >= 20 && !operatorSuspendedOnToken() && vid in firestore.get(/databases/(default)/documents/operators/$(op)/users/$(request.auth.uid)).data.venueIds);
+    }
+    function isJpeg() { return request.resource.contentType == 'image/jpeg' && request.resource.size <= 10 * 1024 * 1024; }
+    function isImage() { return request.resource.contentType.matches('image/(jpeg|png|webp)') && request.resource.size <= 5 * 1024 * 1024; }
+    function isDoc() { return request.resource.contentType.matches('(image/(jpeg|png)|application/pdf)') && request.resource.size <= 15 * 1024 * 1024; }
+    // Ruling AA (finding 9a): mirrors firestore.rules' createOnly() — chain-of-custody evidence must be
+    // create-only. Without this, same-venue staff could overwrite an uploaded object after the fact and
+    // the Firestore photo doc's recorded sha256 would silently disagree with the swapped object.
+    function createOnly() { return resource == null; }
+
+    match /operators/{op}/tickets/{ticketId}/photos/{photoId} {
+      allow read: if isPlatformAdmin() || (staff(op) && inVenueOfTicket(op, ticketId));
+      allow write: if createOnly() && staff(op) && inVenueOfTicket(op, ticketId) && photoId.matches('^[0-9a-f-]{36}\\.jpg$') && isJpeg();
+    }
+    match /operators/{op}/branding/{file} {
+      allow read: if true;
+      // Ruling F-4a (final-review F2): branding stays PUBLICLY readable even when suspended (it's a
+      // public asset, `read: if true` above) — the finding was specifically that an admin could still
+      // WRITE (deface) it after suspension, so only the write branch gates on operatorActive().
+      allow write: if isPlatformAdmin() || (inOperator(op) && isAdmin() && operatorActive(op) && isImage());
+    }
+    match /operators/{op}/claims/{claimId}/{file} {
+      allow read: if isPlatformAdmin() || (inOperator(op) && isAdmin() && operatorActive(op));
+      allow write: if false;
+    }
+    match /operators/{op}/users/{uid}/avatar.jpg {
+      allow read: if isPlatformAdmin() || (staff(op) && operatorActive(op));
+      allow write: if inOperator(op) && request.auth.uid == uid && operatorActive(op) && isJpeg();
+    }
+    match /operators/{op}/users/{uid}/credentials/{file} {
+      allow read: if isPlatformAdmin() || (inOperator(op) && operatorActive(op) && (isAdmin() || request.auth.uid == uid));
+      allow write: if inOperator(op) && operatorActive(op) && (request.auth.uid == uid || isAdmin()) && isDoc();   // admins may upload on behalf (Plan 4a T6)
+    }
+    match /operators/{op}/incidents/{incidentId}/{file} {
+      allow read: if isPlatformAdmin() || (staff(op) && inVenueOfIncident(op, incidentId));
+      allow write: if createOnly() && staff(op) && inVenueOfIncident(op, incidentId) && isJpeg();
+    }
+    match /operators/{op}/exports/{file} { allow read: if isPlatformAdmin() || (inOperator(op) && isAdmin() && operatorActive(op)); allow write: if false; }
+    // Ruling AA (finding 9b): read must NOT depend on isImage() — that reads request.resource, which is
+    // null on a read request, so the combined `allow read, write` errored (denied) on every read attempt.
+    // Split so the guest can read back what they uploaded.
+    match /guests/{uid}/{file} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if signedIn() && request.auth.uid == uid && isImage();
+    }
+    match /marketing/{allPaths=**} { allow read: if true; allow write: if false; }
+    // marketing site (goldstar-web) — rules ownership moves here (Task 8). Read is NOT public: the
+    // site passes tokenized download URLs to its own Function.
+    // N5 (Plan 8 Task 16 — accepted, recorded here): this create is deliberately unauthenticated.
+    // Applicant résumés arrive from the public careers page before any account exists, so the
+    // controls are the size cap + document content types below, create-only (never readable,
+    // never replaceable), and the Functions-side intake that reads them. App Check on this path,
+    // or a per-IP throttle, is to be added ONLY if abuse is observed in the bucket's access logs —
+    // not pre-emptively, since either would cost real applicants on a page with no session.
+    match /resumes/{resumeId} {
+      allow create: if request.resource.size < 10 * 1024 * 1024
+        && request.resource.contentType.matches('application/pdf|application/msword|application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      allow read, update, delete: if false;
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}

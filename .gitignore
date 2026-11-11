@@ -1,0 +1,49 @@
+node_modules
+dist
+functions/lib
+coverage
+.firebase
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+pubsub-debug.log
+database-debug.log
+*.log
+.env*
+!.env.example
+# Non-secret per-project runtime config (Ruling AR, 1d final review finding 11) — Firebase Functions
+# v2 loads `.env.<projectId>` automatically for the matching deploy target; secrets stay in Secret
+# Manager, never in these files.
+# Emulator-only (`demo-goldstar` is the local emulator project id): turns on the demo providers
+# switch (functions/src/lib/demoProviders.ts). No secrets.
+!functions/.env.demo-goldstar
+# Emulator port isolation (infra task, task-platform-report.md) — scripts/emulator-config.mjs's
+# per-PID temp firebase.json copy; deleted in a `finally` block on every normal exit, this pattern
+# is a safety net in case a run is killed uncleanly before that cleanup runs.
+firebase.emulator-offset-*.json
+
+# Local emulator secret overrides (firebase-tools reads functions/.secret.local when it cannot reach Secret Manager). Never committed.
+functions/.secret.local
+
+# Snapshots written by `npm run emulators` (--export-on-exit): local demo/dev state, never committed.
+.emulator-data*/
+
+# never commit: credentials, local state, OS and editor files
+.env
+.env.*
+!.env.example
+!functions/.env.example
+!functions/.env.demo-goldstar
+*.pem
+*.p8
+*.p12
+*service-account*.json
+*adminsdk*.json
+.firebase/
+firebase-export-*/
+*-debug.log
+*.log
+.DS_Store
+.idea/
+.vscode/
+.claude/

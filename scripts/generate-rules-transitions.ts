@@ -1,0 +1,22 @@
+import { readFileSync, writeFileSync } from 'node:fs';
+import { DRIVE_HOME_RULES } from '../src/state/driveHome';
+import { RIDE_RULES } from '../src/state/ride';
+import { VALET_RULES } from '../src/state/valet';
+const tables = { valet: VALET_RULES, drive_home: DRIVE_HOME_RULES, passenger_ride: RIDE_RULES } as const;
+const lines: string[] = ['    // BEGIN GENERATED TRANSITIONS (npm run rules:generate)'];
+lines.push('    function allowedTransition(jobType, from, to) {');
+lines.push('      return ' + Object.entries(tables).map(([jt, rules]) => `(jobType == '${jt}' && (${rules.filter((r) => r.from !== null).map((r) => `(from == '${r.from}' && to == '${r.to}')`).join(' || ')}))`).join('\n        || ') + ';');
+lines.push('    }');
+lines.push('    function roleMayTransition(jobType, from, to, isClaimant) {');
+lines.push('      return ' + Object.entries(tables).map(([jt, rules]) => `(jobType == '${jt}' && (${rules.filter((r) => r.from !== null).map((r) => {
+  const base = `roles().hasAny(${JSON.stringify([...r.roles])})`;
+  const cl = r.claimantRoles ? ` || (isClaimant && roles().hasAny(${JSON.stringify([...r.claimantRoles])}))` : '';
+  return `(from == '${r.from}' && to == '${r.to}' && (${base}${cl}))`;
+}).join(' || ')}))`).join('\n        || ') + ';');
+lines.push('    }');
+lines.push('    // END GENERATED TRANSITIONS');
+const file = readFileSync('firestore.rules', 'utf8');
+const out = file.replace(/ {4}\/\/ BEGIN GENERATED TRANSITIONS[\s\S]*?\/\/ END GENERATED TRANSITIONS/, lines.join('\n'));
+if (out === file && !file.includes('BEGIN GENERATED')) throw new Error('markers not found in firestore.rules');
+writeFileSync('firestore.rules', out);
+console.log('rules transitions regenerated');

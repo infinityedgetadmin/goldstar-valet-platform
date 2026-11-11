@@ -1,0 +1,6 @@
+import { z } from 'zod';
+import { currencySchema, isoDateSchema, moneySchema, uuidSchema } from './common';
+// venueId is denormalized from the ticket by Functions at write time (transactions aren't
+// authored with a venue of their own — it's copied so rules/queries can scope by venue).
+export const transactionSchema = z.object({ id: z.string().min(1), operatorId: z.string().min(1), venueId: z.string().min(1), ticketId: uuidSchema, provider: z.enum(['stripe', 'pms', 'pos', 'invoice']), providerRef: z.string().min(1), kind: z.enum(['charge', 'refund', 'room_charge', 'venue_invoice']), status: z.enum(['pending', 'authorized', 'succeeded', 'failed', 'refunded']), base: moneySchema, tip: moneySchema, tax: moneySchema, fees: moneySchema, total: moneySchema, currency: currencySchema, method: z.enum(['web', 'in_app', 'tap_to_pay', 'reader', 'pms', 'pos', 'invoice']), at: isoDateSchema, destinationAccountId: z.string().optional(), platformFee: moneySchema.optional(), refunds: z.array(z.object({ refundRef: z.string(), amount: moneySchema, at: isoDateSchema, reason: z.string() })).default([]), chargeRef: z.string().optional(), failureMessage: z.string().optional() });
+export type Transaction = z.infer<typeof transactionSchema>;

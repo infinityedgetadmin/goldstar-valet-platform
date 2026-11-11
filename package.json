@@ -1,0 +1,73 @@
+{
+  "name": "@goldstar/platform",
+  "version": "0.4.12",
+  "private": true,
+  "description": "Goldstar valet platform contracts: types, schemas, state machines, tokens",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./tokens": {
+      "import": {
+        "types": "./dist/tokens/index.d.ts",
+        "default": "./dist/tokens/index.js"
+      },
+      "require": {
+        "types": "./dist/tokens/index.d.cts",
+        "default": "./dist/tokens/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepare": "tsup",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "type-check:scripts": "tsc -p scripts/tsconfig.json --noEmit",
+    "lint": "eslint src scripts",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "check:consumers": "tsx scripts/check-contracts-version.ts",
+    "check-all": "npm run type-check && npm run type-check:scripts && npm run lint && npm run test",
+    "emulators": "node scripts/emulator-config.mjs start --import=./.emulator-data --export-on-exit",
+    "test:rules": "node scripts/emulator-config.mjs exec --only firestore,storage \"vitest run -c test/rules/vitest.config.ts\"",
+    "test:functions": "node scripts/emulator-config.mjs exec --only firestore,auth,storage \"npm --prefix functions run test\"",
+    "indexes:generate": "tsx scripts/generate-indexes.ts",
+    "rules:generate": "tsx scripts/generate-rules-transitions.ts",
+    "seed:emulator": "node scripts/emulator-config.mjs exec --only firestore,auth,storage \"tsx scripts/seed-emulator.ts\"",
+    "seed:demo": "tsx scripts/seed-demo.ts"
+  },
+  "dependencies": {
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@firebase/rules-unit-testing": "^4.0.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "firebase": "^11.0.0",
+    "firebase-admin": "^13.0.0",
+    "firebase-tools": "^14.0.0",
+    "prettier": "^3.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^3.0.0"
+  }
+}
