@@ -47,3 +47,6 @@ firebase-export-*/
 .idea/
 .vscode/
 .claude/
+
+# offline kit (bundled Java runtime and emulator files); carried beside the repo, never committed
+.offline/
